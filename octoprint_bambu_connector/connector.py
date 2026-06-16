@@ -30,11 +30,13 @@ from octoprint.printer import (
 from octoprint.printer.connection import (
     OPERATIONAL_STATES,
     PRINTING_STATES,
+    CLOSED_STATES,
     ConnectedPrinter,
     ConnectedPrinterListenerMixin,
     ConnectedPrinterState,
 )
 from octoprint.printer.job import PrintJob
+from octoprint.printer import FirmwareInformation
 from octoprint.schema import BaseModel
 from octoprint.util.version import is_version_compatible, safe_get_package_version
 from octoprint.util.tz import LOCAL_TZ
@@ -245,6 +247,7 @@ class ConnectedBambuPrinter(
         self._progress: JobProgress = None
         self._old_progress: int = None
         self._old_time_remaining: int = None
+        self._last_printer_job: tuple[str, int] = None
 
         self._files: list[PrinterFile] = []
 
@@ -309,19 +312,23 @@ class ConnectedBambuPrinter(
                 self.refresh_printer_files(blocking=True)
                 self._listener.on_printer_files_available(True)
 
-            if state in PRINTING_STATES:
-                if old_state not in PRINTING_STATES and not self.current_job:
+            if state in PRINTING_STATES and old_state not in PRINTING_STATES:
+                # we went from not printing to printing -> started
+                if not self.current_job:
                     # we went from not printing to printing without having a job
                     # -> this was triggered by the printer!
                     self.set_job(
                         PrintJob(
-                            storage=FileDestinations.PRINTER, path="???", display="???"
+                            storage=FileDestinations.PRINTER,
+                            path="???",
+                            display="???",
                         )
                     )
                     self._listener.on_printer_job_changed(self.current_job)
+
                 self._listener.on_printer_job_started()
 
-            elif old_state in PRINTING_STATES:
+            elif old_state in PRINTING_STATES and state not in PRINTING_STATES:
                 # we went from printing to not printing, so the current job is done
                 # one way or the other
 
@@ -433,7 +440,6 @@ class ConnectedBambuPrinter(
             return
         self._disconnecting = True
 
-        eventManager().fire(Events.DISCONNECTING)
         if is_version_compatible(self._bpm_version, "<=1.0.2"):
             # workaround until synman/bambu-printer-manager#54 is merged
             self._client._client.disconnect()
@@ -901,8 +907,10 @@ class ConnectedBambuPrinter(
             return
 
         try:
+            self._update_state_from_state(
+                printer
+            )  # eval state before job, so current state is known in job eval
             self._update_job_from_state(printer)
-            self._update_state_from_state(printer)
             self._update_progress_from_state(printer)
             self._update_temperatures_from_state(printer)
         except Exception:
@@ -943,6 +951,13 @@ class ConnectedBambuPrinter(
                 plate = int(plate_match.group("plate"))
             else:
                 plate = 1
+
+        if (
+            self._last_printer_job == (current_path, plate)
+            and self.state not in PRINTING_STATES
+        ):
+            return
+        self._last_printer_job = (current_path, plate)
 
         if (
             self.current_job
@@ -1056,6 +1071,18 @@ class ConnectedBambuPrinter(
         if new_state:
             self._state_context = (new_state, printer.active_job_info.stage_name)
             self.set_state(new_state, error=error)
+
+            if new_state in CLOSED_STATES:
+                self.firmware_info = None
+            elif not self.firmware_info:
+                self.firmware_info = FirmwareInformation(
+                    name="Bambu",
+                    data={
+                        "model": printer.config.printer_model.name,
+                        "version": printer.config.firmware_version,
+                        "ams_firmware_version": printer.config.ams_firmware_version,
+                    },
+                )
 
     def _update_progress_from_state(self, printer: bpm.bambuprinter.BambuPrinter):
         if self.current_job is None:
